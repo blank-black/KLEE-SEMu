@@ -217,7 +217,11 @@ cl::opt<bool> semuQuiet("semu-quiet",
 	
 cl::list<std::string> semuCustomOutEnvFunction("semu-custom-output-function",
 					       cl::desc("Specify the functions to consider as output functions, besides the standard ones."));
-                                          
+                                      
+cl::opt<bool> semuNoCompareMemoryLimitDiscarded("semu-no-compare-memory-limit-discarded",
+                                 cl::init(false),
+                                 cl::desc("(TODO) Disable comparison of states that were stopped due to memory limit (useful to ensure the the memory limit is kept when large checkpoint window)"));
+
 /**** SEMu Under development ****/
 // Use shadow test case generation for mutants ()
 cl::opt<bool> semuShadowTestGeneration("semu-shadow-test-gen", 
@@ -557,7 +561,7 @@ const Module *Executor::setModule(llvm::Module *module,
     klee_error ("@KLEE-SEMu - ERROR: The module is missing mutant selector Function");
   }
   ks_postMutationPoint_Func = module->getFunction(ks_postMutationPointFuncName);
-  if (!ks_postMutationPoint_Func || ks_postMutationPoint_Func->arg_size() != 2) {
+  if (!semuDisableCheckAtPostMutationPoint && (!ks_postMutationPoint_Func || ks_postMutationPoint_Func->arg_size() != 2)) {
     assert (false && "@KLEE-SEMu - ERROR: The module is missing post mutation point function");
     klee_error ("@KLEE-SEMu - ERROR: The module is missing post mutation point function");
   }
@@ -617,7 +621,7 @@ const Module *Executor::setModule(llvm::Module *module,
     klee_error ("@KLEE-SEMu - ERROR: The module is missing mutant selector Function");
   }
   ks_postMutationPoint_Func = module->getFunction(ks_postMutationPointFuncName);
-  if (!ks_postMutationPoint_Func || ks_postMutationPoint_Func->arg_size() != 2) {
+  if (!semuDisableCheckAtPostMutationPoint && (!ks_postMutationPoint_Func || ks_postMutationPoint_Func->arg_size() != 2)) {
     assert (false && "@KLEE-SEMu - ERROR: The module is missing post mutation point function");
     klee_error ("@KLEE-SEMu - ERROR: The module is missing post mutation point function");
   }
@@ -2047,7 +2051,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
             break;  //case
         }
     } else if (f == ks_postMutationPoint_Func) {
-      // Do nothing. Will be checked later
+      // Do nothing. Will be checked later, if !semuDisableCheckAtPostMutationPoint
       break;
     }
     //~KS
@@ -4512,14 +4516,15 @@ void Executor::ks_FilterMutants (llvm::Module *module) {
               // update max mutant id              
               ks_max_mutant_id = std::max(ks_max_mutant_id, 
                                       *std::max_element(tosCandIds.begin(), tosCandIds.end()));
-              ks_number_of_mutants++;
 
               for (auto i = 0u; i < fromsCandIds.size() - 1; ++i) {
+                ks_number_of_mutants += tosCandIds[i] - fromsCandIds[i] + 1;
                 auto *clonei = llvm::dyn_cast<llvm::CallInst>(calli->clone());
                 clonei->insertBefore(calli);
                 clonei->setArgOperand(0, llvm::ConstantInt::get(clonei->getArgOperand(0)->getType(), fromsCandIds[i]));
                 clonei->setArgOperand(1, llvm::ConstantInt::get(clonei->getArgOperand(1)->getType(), tosCandIds[i]));
               }
+              ks_number_of_mutants += tosCandIds[tosCandIds.size() - 1] - fromsCandIds[fromsCandIds.size() - 1] + 1;
               calli->setArgOperand(0, llvm::ConstantInt::get(calli->getArgOperand(0)->getType(), fromsCandIds[fromsCandIds.size() - 1]));
               calli->setArgOperand(1, llvm::ConstantInt::get(calli->getArgOperand(1)->getType(), tosCandIds[tosCandIds.size() - 1]));
             }
@@ -5036,8 +5041,21 @@ void Executor::ks_compareStates (std::vector<ExecutionState *> &remainStates, bo
     // This may happend because an original ma terminate before its corresponding mutant
     // and thus, it will be removed from ks_terminatedBeforeWP at a "next check" before the mutant's watch point
     if (correspOriginals.empty()) {
+      if (outEnvOnly) {
+        // no original left, no comparison to be done. Let the generation to the checkpoint
+        remainStates.clear();
+        remainStates.insert(remainStates.begin(), ks_reachedOutEnv.begin(), ks_reachedOutEnv.end());
+        return;
+      }
+      
       // No need to continue with the mutants since original finished
       // Remove the mutants of the subtree from ks_reachedWatchPoint..., add to terminated
+#ifdef SEMU_RELMUT_PRED_ENABLED
+      // RELMUT: Do not remove induced mutants if old version (the mutants might sill be needed). Of course, in case they are no more needed
+      // they will be explored in vain. 
+      // FIXME: find a better way to avoid exploration in vain in this case
+      if (es->ks_old_new == -1)
+#endif
       ks_terminateSubtreeMutants(es);
       //continue;
 
@@ -5318,7 +5336,7 @@ bool Executor::ks_compareRecursive (ExecutionState *mState,
       || (postMutOnly && ks_atPointPostMutation.count(mState) > 0)) {
     for (auto mSisState: mSisStatesVect) {
 #ifdef SEMU_RELMUT_PRED_ENABLED
-      if (mSisState->ks_old_new <= 0 && !postMutOnly) // No need for pre-commit original, except postMut
+      if (mSisState != nullptr && mSisState->ks_old_new <= 0 && !postMutOnly) // No need for pre-commit original, except postMut
         continue; 
 #endif
       int sDiff = ExecutionState::KS_StateDiff_t::ksNO_DIFF; 
